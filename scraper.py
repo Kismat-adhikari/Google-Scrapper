@@ -10,10 +10,11 @@ import csv
 import json
 import logging
 import random
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import quote_plus
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
@@ -94,6 +95,11 @@ class PlaceScraper:
         self.scraped_places = []
         self.seen_places = set()
         
+        # Email regex pattern
+        self.email_pattern = re.compile(
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        )
+        
     async def setup_browser(self, proxy: Optional[Dict] = None) -> Tuple[Browser, BrowserContext, any]:
         """Setup browser with optional proxy"""
         self.playwright = await async_playwright().start()
@@ -105,10 +111,18 @@ class PlaceScraper:
             '--lang=en-US'
         ]
         
-        browser = await self.playwright.chromium.launch(
-            headless=self.headless,
-            args=browser_args
-        )
+        # Launch options
+        launch_options = {
+            'headless': self.headless,
+            'args': browser_args
+        }
+        
+        # Add proxy to launch options if provided
+        if proxy:
+            launch_options['proxy'] = proxy
+            logger.info(f"Using proxy: {proxy['server']}")
+        
+        browser = await self.playwright.chromium.launch(**launch_options)
         
         context_options = {
             'user_agent': random.choice(USER_AGENTS),
@@ -119,10 +133,6 @@ class PlaceScraper:
                 'Accept-Language': 'en-US,en;q=0.9'
             }
         }
-        
-        if proxy:
-            context_options['proxy'] = proxy
-            logger.info(f"Using proxy: {proxy['server']}")
         
         context = await browser.new_context(**context_options)
         
@@ -227,7 +237,7 @@ class PlaceScraper:
                     return lat, lon
             
             # Method 2: From data attributes or meta tags
-            lat_lon = await page.evaluate("""() => {
+            lat_lon = await page.evaluate(r"""() => {
                 // Try to find coordinates in meta tags
                 const metaTag = document.querySelector('meta[itemprop="geo"]');
                 if (metaTag) {
@@ -286,13 +296,141 @@ class PlaceScraper:
             pass
         return None
     
-    async def parse_place_details(self, page: Page) -> Optional[Dict]:
+    def extract_emails_from_text(self, text: str) -> Set[str]:
+        """Extract email addresses from text using regex"""
+        if not text:
+            return set()
+        
+        emails = set(self.email_pattern.findall(text))
+        
+        # Filter out common false positives
+        filtered_emails = set()
+        exclude_patterns = [
+            'example.com', 'test.com', 'domain.com', 
+            'email.com', 'yourdomain.com', 'yoursite.com',
+            'sentry.io', 'wixpress.com', 'schema.org',
+            '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'
+        ]
+        
+        for email in emails:
+            email_lower = email.lower()
+            if not any(pattern in email_lower for pattern in exclude_patterns):
+                filtered_emails.add(email)
+        
+        return filtered_emails
+    
+    async def scrape_emails_from_google_maps(self, page: Page) -> Set[str]:
+        """Extract emails directly from Google Maps listing"""
+        emails = set()
+        
+        try:
+            # Get all text content from the page
+            page_text = await page.evaluate("() => document.body.innerText")
+            emails.update(self.extract_emails_from_text(page_text))
+            
+            # Check specific sections that might contain emails
+            selectors_to_check = [
+                'div[role="main"]',
+                'div.m6QErb',  # Info section
+                'button[data-item-id]',  # Action buttons
+                'a[href^="mailto:"]'  # Mailto links
+            ]
+            
+            for selector in selectors_to_check:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        text = await element.inner_text()
+                        emails.update(self.extract_emails_from_text(text))
+                        
+                        # Check href for mailto
+                        href = await element.get_attribute('href')
+                        if href and 'mailto:' in href:
+                            email = href.replace('mailto:', '').split('?')[0]
+                            if '@' in email:
+                                emails.add(email)
+                except Exception:
+                    continue
+            
+            if emails:
+                logger.info(f"Found {len(emails)} email(s) on Google Maps: {', '.join(emails)}")
+                
+        except Exception as e:
+            logger.debug(f"Error scraping emails from Google Maps: {e}")
+        
+        return emails
+    
+    async def scrape_emails_from_website(self, website_url: str, context: BrowserContext) -> Set[str]:
+        """Visit business website and scrape for emails"""
+        emails = set()
+        
+        if not website_url or 'google.com' in website_url:
+            return emails
+        
+        page = None
+        try:
+            logger.info(f"Visiting website for emails: {website_url}")
+            page = await context.new_page()
+            
+            # Set shorter timeout for website visits
+            await page.goto(website_url, timeout=15000, wait_until='domcontentloaded')
+            await asyncio.sleep(1)
+            
+            # Get page content
+            page_text = await page.evaluate("() => document.body.innerText")
+            page_html = await page.content()
+            
+            # Extract emails from text
+            emails.update(self.extract_emails_from_text(page_text))
+            emails.update(self.extract_emails_from_text(page_html))
+            
+            # Check common contact page patterns
+            contact_links = await page.query_selector_all('a[href*="contact"], a[href*="about"], a[href*="team"]')
+            
+            for link in contact_links[:3]:  # Check first 3 contact-related links
+                try:
+                    href = await link.get_attribute('href')
+                    if href and not href.startswith('mailto:'):
+                        # Make absolute URL
+                        if href.startswith('/'):
+                            from urllib.parse import urljoin
+                            href = urljoin(website_url, href)
+                        
+                        if href.startswith('http'):
+                            await page.goto(href, timeout=10000, wait_until='domcontentloaded')
+                            await asyncio.sleep(0.5)
+                            
+                            sub_text = await page.evaluate("() => document.body.innerText")
+                            emails.update(self.extract_emails_from_text(sub_text))
+                            
+                            # Go back
+                            await page.goto(website_url, timeout=10000, wait_until='domcontentloaded')
+                except Exception:
+                    continue
+            
+            if emails:
+                logger.info(f"Found {len(emails)} email(s) on website: {', '.join(emails)}")
+            else:
+                logger.debug("No emails found on website")
+                
+        except Exception as e:
+            logger.debug(f"Error scraping website for emails: {e}")
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        
+        return emails
+    
+    async def parse_place_details(self, page: Page, context: BrowserContext) -> Optional[Dict]:
         """Parse all details from a place page"""
         try:
             await self.random_delay(TIMING['item_parse_delay'], TIMING['item_parse_delay'] + 0.5)
             
             # Wait for page to fully load
-            await page.wait_for_load_state('networkidle', timeout=5000)
+            await page.wait_for_load_state('networkidle', timeout=TIMING['networkidle_timeout'])
             
             # Check for blocking
             if await self.check_for_captcha(page):
@@ -320,6 +458,9 @@ class PlaceScraper:
             
             # Extract phone
             phone = await self.extract_text(page, SELECTORS['place_phone'])
+            
+            # Extract emails from Google Maps page
+            emails_from_maps = await self.scrape_emails_from_google_maps(page)
             
             # Extract website - check multiple locations
             website = await self.extract_attribute(page, SELECTORS['place_website'], 'href')
@@ -355,13 +496,22 @@ class PlaceScraper:
                 except Exception as e:
                     logger.debug(f"Error checking Menu tab for website: {e}")
             
+            # Scrape emails from website if available
+            emails_from_website = set()
+            if website:
+                emails_from_website = await self.scrape_emails_from_website(website, context)
+            
+            # Combine all emails
+            all_emails = emails_from_maps.union(emails_from_website)
+            email_string = ', '.join(sorted(all_emails)) if all_emails else None
+            
             # Extract category
             category = await self.extract_text(page, SELECTORS['place_category'])
             
             # Extract rating - multiple methods
             rating = None
             try:
-                rating = await page.evaluate("""() => {
+                rating = await page.evaluate(r"""() => {
                     // Method 1: Look for rating in common locations
                     let selectors = [
                         'div.F7nice span[aria-hidden="true"]',
@@ -470,6 +620,7 @@ class PlaceScraper:
                 'latitude': lat,
                 'longitude': lon,
                 'phone': phone,
+                'email': email_string,
                 'website': website,
                 'google_maps_url': place_url,
                 'category': category,
@@ -480,7 +631,7 @@ class PlaceScraper:
                 'scraped_at': datetime.now().isoformat()
             }
             
-            logger.info(f"Scraped: {name}")
+            logger.info(f"Scraped: {name} | Emails: {email_string or 'None found'}")
             return place_data
             
         except Exception as e:
@@ -579,8 +730,8 @@ class PlaceScraper:
                         if await self.check_for_captcha(page):
                             raise Exception("CAPTCHA detected, rotating proxy")
                         
-                        # Parse place details
-                        place_data = await self.parse_place_details(page)
+                        # Parse place details (pass context for website scraping)
+                        place_data = await self.parse_place_details(page, context)
                         if place_data:
                             self.scraped_places.append(place_data)
                         

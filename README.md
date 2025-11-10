@@ -85,6 +85,7 @@ The scraper collects the following information for each place:
 - Full address
 - Latitude & longitude
 - Phone number
+- **Email address(es)** - scraped from both Google Maps listing and business website
 - Website URL
 - Category/type
 - Rating (stars)
@@ -122,9 +123,13 @@ Customize selectors and settings in `config.py`:
 3. **Search**: Navigates to Google Maps and searches for keyword + location
 4. **Result Collection**: Scrolls and collects all result links
 5. **Detail Extraction**: Visits each place and extracts all details
-6. **Anti-Bot Handling**: Detects CAPTCHAs/blocking and rotates proxy automatically
-7. **Deduplication**: Filters duplicates by name and coordinates
-8. **Save Results**: Exports to CSV and JSONL with logging
+6. **Email Scraping**: 
+   - Extracts emails from Google Maps listing
+   - Visits business website and scrapes for emails
+   - Checks contact/about pages for additional emails
+7. **Anti-Bot Handling**: Detects CAPTCHAs/blocking and rotates proxy automatically
+8. **Deduplication**: Filters duplicates by name and coordinates
+9. **Save Results**: Exports to CSV and JSONL with logging
 
 ## Anti-Bot Features
 
