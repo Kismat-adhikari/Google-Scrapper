@@ -5,3 +5,13 @@ python scraper.py
 
 TO SEARCH WITH URL:
 python scraper_by_link.py
+
+
+TIME TAKEN:
+
+For 70 businesses:
+
+~50% have email on homepage: 3-5 sec each
+~30% have email on contact: 7-9 sec each
+~20% have no email: 5 sec each (tries and moves on)
+Total: ~20-30 minutes (vs 50+ minutes before
