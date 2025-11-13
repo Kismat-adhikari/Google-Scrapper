@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Google Maps Scraper using Playwright
-Scrapes place details with proxy rotation and anti-bot detection
+Google Maps Scraper by Link using Playwright
+Accepts Google Maps URLs and scrapes place details with proxy rotation and anti-bot detection
 """
 
 import argparse
@@ -15,8 +15,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
-from urllib.parse import quote_plus
-import os
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
 from geopy.distance import geodesic
@@ -25,7 +24,7 @@ from config import SELECTORS, TIMING, GEO_TOLERANCE_METERS, USER_AGENTS
 
 
 # Setup logging
-def setup_logging(log_file: str = "scraper.log"):
+def setup_logging(log_file: str = "scraper_link.log"):
     """Configure logging to file and console"""
     logging.basicConfig(
         level=logging.INFO,
@@ -41,193 +40,17 @@ def setup_logging(log_file: str = "scraper.log"):
 logger = setup_logging()
 
 
-class ProgressTracker:
-    """Track and display scraping progress"""
-    def __init__(self, total: int):
-        self.total = total
-        self.success = 0
-        self.failed = 0
-        self.current = 0
-    
-    def increment_success(self):
-        self.success += 1
-        self.current += 1
-        self.display()
-    
-    def increment_failed(self):
-        self.failed += 1
-        self.current += 1
-        self.display()
-    
-    def display(self):
-        percent = (self.current / self.total * 100) if self.total > 0 else 0
-        bar_length = 30
-        filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
-        bar = '=' * filled + '>' + '.' * (bar_length - filled - 1) if filled < bar_length else '=' * bar_length
-        
-        print(f"\r[{bar}] {self.current}/{self.total} | Success: {self.success} | Failed: {self.failed} | {percent:.1f}%", end='', flush=True)
-        
-        if self.current >= self.total:
-            print()  # New line when complete
-
-
-class IncrementalSaver:
-    """Save results incrementally as they're scraped"""
-    def __init__(self, keyword: str, location: str):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_keyword = keyword.replace(' ', '_')
-        safe_location = location.replace(' ', '_')
-        self.base_filename = f"results_{safe_keyword}_{safe_location}_{timestamp}"
-        self.csv_filename = f"{self.base_filename}.csv"
-        self.jsonl_filename = f"{self.base_filename}.jsonl"
-        self.resume_filename = f"{self.base_filename}_resume.json"
-        self.failed_filename = f"{self.base_filename}_failed.txt"
-        self.csv_initialized = False
-        self.scraped_urls = set()
-        
-    def save_place(self, place: Dict):
-        """Save a single place immediately"""
-        # Save to CSV
-        try:
-            file_exists = os.path.exists(self.csv_filename)
-            with open(self.csv_filename, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=place.keys())
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(place)
-        except Exception as e:
-            logger.error(f"Error saving to CSV: {e}")
-        
-        # Save to JSONL
-        try:
-            with open(self.jsonl_filename, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(place) + '\n')
-        except Exception as e:
-            logger.error(f"Error saving to JSONL: {e}")
-        
-        # Track scraped URL
-        if 'google_maps_url' in place:
-            self.scraped_urls.add(place['google_maps_url'])
-            self.save_resume_state()
-    
-    def save_failed_url(self, url: str, error: str):
-        """Save failed URLs for manual review"""
-        try:
-            with open(self.failed_filename, 'a', encoding='utf-8') as f:
-                f.write(f"{url} | Error: {error}\n")
-        except Exception as e:
-            logger.error(f"Error saving failed URL: {e}")
-    
-    def save_resume_state(self):
-        """Save current progress for resume capability"""
-        try:
-            with open(self.resume_filename, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'scraped_urls': list(self.scraped_urls),
-                    'timestamp': datetime.now().isoformat()
-                }, f)
-        except Exception as e:
-            logger.error(f"Error saving resume state: {e}")
-    
-    def load_resume_state(self) -> Set[str]:
-        """Load previously scraped URLs"""
-        if os.path.exists(self.resume_filename):
-            try:
-                with open(self.resume_filename, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return set(data.get('scraped_urls', []))
-            except Exception as e:
-                logger.error(f"Error loading resume state: {e}")
-        return set()
-
-
-class EmailValidator:
-    """Validate and clean email addresses"""
-    @staticmethod
-    def is_valid_email(email: str) -> bool:
-        """Basic email validation"""
-        if not email or '@' not in email:
-            return False
-        
-        # More strict pattern
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        if not re.match(pattern, email):
-            return False
-        
-        # Check for common invalid patterns
-        invalid_patterns = [
-            'example.com', 'test.com', 'domain.com',
-            'email.com', 'yourdomain', 'yoursite',
-            'sentry.io', 'wixpress.com', 'schema.org',
-            '.png', '.jpg', '.jpeg', '.gif', '.svg',
-            'test@', 'demo@', 'sample@', 'noreply@', 'no-reply@',
-            'admin@example', 'user@example', 'info@example',
-            '@test.', '@demo.', '@sample.', '@placeholder.',
-            'placeholder@', 'fake@', 'dummy@'
-        ]
-        
-        email_lower = email.lower()
-        # Skip if contains any exclude pattern
-        if any(pattern in email_lower for pattern in invalid_patterns):
-            return False
-        # Skip if it starts with test/demo/sample/fake/dummy
-        local_part = email_lower.split('@')[0]
-        if local_part in ('test', 'demo', 'sample', 'fake', 'dummy', 'noreply', 'no-reply'):
-            return False
-        return True
-    
-    @staticmethod
-    def validate_and_clean(emails: Set[str]) -> Set[str]:
-        """Validate and clean a set of emails"""
-        return {email for email in emails if EmailValidator.is_valid_email(email)}
-
-
-class DataCleaner:
-    """Clean and standardize data"""
-    @staticmethod
-    def clean_phone(phone: str) -> Optional[str]:
-        """Clean and standardize phone number"""
-        if not phone:
-            return None
-        
-        # Remove all non-digit characters except + at start
-        cleaned = re.sub(r'[^\d+]', '', phone)
-        
-        # Basic validation - at least 10 digits
-        digits = re.sub(r'[^\d]', '', cleaned)
-        if len(digits) < 10:
-            return None
-        
-        return cleaned if cleaned else None
-    
-    @staticmethod
-    def clean_address(address: str) -> Optional[str]:
-        """Clean and standardize address"""
-        if not address:
-            return None
-        
-        # Remove extra whitespace
-        cleaned = ' '.join(address.split())
-        
-        # Remove leading/trailing commas
-        cleaned = cleaned.strip(',').strip()
-        
-        return cleaned if cleaned else None
-
-
 class ProxyManager:
-    """Manages proxy rotation from file with dead proxy tracking"""
+    """Manages proxy rotation from file"""
     
     def __init__(self, proxy_file: Optional[str] = None):
         self.proxies = []
         self.current_index = 0
-        self.dead_proxies = set()  # Track failed proxies
-        self.proxy_errors = {}  # Count errors per proxy
         
         if proxy_file and Path(proxy_file).exists():
             self.load_proxies(proxy_file)
         else:
-            logger.debug(f"Proxy file not found or not provided: {proxy_file}")
+            logger.warning(f"No proxy file provided or file not found: {proxy_file}")
     
     def load_proxies(self, proxy_file: str):
         """Load proxies from file (format: ip:port:username:password)"""
@@ -250,79 +73,26 @@ class ProxyManager:
             logger.error(f"Error loading proxies: {e}")
     
     def get_next_proxy(self) -> Optional[Dict]:
-        """Get next proxy in rotation, skipping dead ones"""
+        """Get next proxy in rotation"""
         if not self.proxies:
             return None
         
-        # Skip dead proxies
-        attempts = 0
-        max_attempts = len(self.proxies)
-        
-        while attempts < max_attempts:
-            proxy = self.proxies[self.current_index]
-            proxy_id = proxy.get('server', 'unknown')
-            
-            self.current_index = (self.current_index + 1) % len(self.proxies)
-            
-            # Skip if marked as dead
-            if proxy_id in self.dead_proxies:
-                attempts += 1
-                continue
-            
-            # Log which proxy is being used (mask sensitive info)
-            proxy_ip = proxy_id.replace('http://', '').split(':')[0] if proxy_id else 'unknown'
-            logger.info(f"[PROXY] Using proxy: {proxy_ip}... ({self.current_index}/{len(self.proxies)})")
-            
-            return proxy
-        
-        # All proxies are dead
-        logger.error("All proxies are marked as dead!")
-        return None
-    
-    def mark_proxy_error(self, proxy: Optional[Dict], error_type: str = "unknown"):
-        """Mark a proxy as having an error"""
-        if not proxy:
-            return
-        
-        proxy_id = proxy.get('server', 'unknown')
-        
-        if proxy_id not in self.proxy_errors:
-            self.proxy_errors[proxy_id] = 0
-        
-        self.proxy_errors[proxy_id] += 1
-        
-        # Mark as dead after 3 consecutive errors
-        if self.proxy_errors[proxy_id] >= 3:
-            self.dead_proxies.add(proxy_id)
-            logger.warning(f"[PROXY] Marked proxy as dead after {self.proxy_errors[proxy_id]} errors: {proxy_id.replace('http://', '').split(':')[0]}")
-    
-    def reset_proxy_errors(self, proxy: Optional[Dict]):
-        """Reset error count for a working proxy"""
-        if not proxy:
-            return
-        
-        proxy_id = proxy.get('server', 'unknown')
-        if proxy_id in self.proxy_errors:
-            self.proxy_errors[proxy_id] = 0
+        proxy = self.proxies[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.proxies)
+        return proxy
 
 
-class PlaceScraper:
-    """Main scraper class for Google Maps"""
+class LinkScraper:
+    """Main scraper class for Google Maps links"""
     
-    def __init__(self, keyword: str, location: str, max_results: int, 
-                 headless: bool, proxy_manager: ProxyManager, saver: IncrementalSaver, 
-                 progress: ProgressTracker, skip_websites: bool = False):
-        self.keyword = keyword
-        self.location = location
+    def __init__(self, maps_url: str, max_results: int, headless: bool, proxy_manager: ProxyManager, skip_websites: bool = False):
+        self.maps_url = maps_url
         self.max_results = max_results
         self.headless = headless
         self.proxy_manager = proxy_manager
-        self.saver = saver
-        self.progress = progress
         self.skip_websites = skip_websites
         self.scraped_places = []
         self.seen_places = set()
-        self.current_proxy = None
         
         # Email regex pattern
         self.email_pattern = re.compile(
@@ -380,8 +150,8 @@ class PlaceScraper:
     
     async def random_delay(self, min_sec: float = None, max_sec: float = None):
         """Add random human-like delay"""
-        min_sec = min_sec or TIMING['min_delay']
-        max_sec = max_sec or TIMING['max_delay']
+        min_sec = min_sec or 0.3  # Faster delays
+        max_sec = max_sec or 0.8  # Faster delays
         await asyncio.sleep(random.uniform(min_sec, max_sec))
     
     async def check_for_captcha(self, page: Page) -> bool:
@@ -404,17 +174,46 @@ class PlaceScraper:
         
         return False
     
-    async def search_google_maps(self, page: Page) -> bool:
-        """Navigate to Google Maps and perform search"""
+    def detect_link_type(self, url: str) -> str:
+        """Detect the type of Google Maps link"""
+        if '/search/' in url or 'search?' in url:
+            return 'search'
+        elif '/place/' in url:
+            return 'place'
+        elif 'goo.gl' in url or 'maps.app.goo.gl' in url:
+            return 'short'
+        else:
+            return 'unknown'
+    
+    async def resolve_short_link(self, page: Page, short_url: str) -> str:
+        """Resolve short Google Maps link to full URL"""
         try:
-            # First visit Google Maps in English to set language
-            logger.info("Opening Google Maps in English...")
-            await page.goto('https://www.google.com/maps?hl=en', timeout=TIMING['page_load_timeout'], wait_until='domcontentloaded')
-            await self.random_delay(1, 2)
+            logger.info(f"Resolving short link: {short_url}")
+            await page.goto(short_url, timeout=TIMING['page_load_timeout'], wait_until='domcontentloaded')
+            await self.random_delay(2, 3)
+            return page.url
+        except Exception as e:
+            logger.error(f"Error resolving short link: {e}")
+            return short_url
+    
+    async def navigate_to_link(self, page: Page) -> bool:
+        """Navigate to the Google Maps link"""
+        try:
+            url = self.maps_url
+            link_type = self.detect_link_type(url)
             
-            # Now perform the search
-            search_query = f"{self.keyword} in {self.location}"
-            url = f"https://www.google.com/maps/search/{quote_plus(search_query)}?hl=en"
+            logger.info(f"Link type detected: {link_type}")
+            
+            # Resolve short links first
+            if link_type == 'short':
+                url = await self.resolve_short_link(page, url)
+                link_type = self.detect_link_type(url)
+                logger.info(f"Resolved to: {url}")
+            
+            # Ensure English language
+            if '?hl=' not in url and '&hl=' not in url:
+                separator = '&' if '?' in url else '?'
+                url = f"{url}{separator}hl=en"
             
             logger.info(f"Navigating to: {url}")
             await page.goto(url, timeout=TIMING['page_load_timeout'], wait_until='domcontentloaded')
@@ -424,18 +223,31 @@ class PlaceScraper:
             if await self.check_for_captcha(page):
                 return False
             
-            # Wait for results to load
-            try:
-                await page.wait_for_selector(SELECTORS['results_container'], timeout=10000)
-                logger.info("Search results loaded")
+            # Wait for content to load based on link type
+            if link_type == 'search':
+                try:
+                    await page.wait_for_selector(SELECTORS['results_container'], timeout=10000)
+                    logger.info("Search results loaded")
+                    return True
+                except PlaywrightTimeout:
+                    logger.error("Results container not found")
+                    return False
+            elif link_type == 'place':
+                try:
+                    await page.wait_for_selector(SELECTORS['place_name'], timeout=10000)
+                    logger.info("Place page loaded")
+                    return True
+                except PlaywrightTimeout:
+                    logger.error("Place name not found")
+                    return False
+            else:
+                logger.warning(f"Unknown link type, attempting to scrape anyway")
                 return True
-            except PlaywrightTimeout:
-                logger.error("Results container not found")
-                return False
                 
         except Exception as e:
-            logger.error(f"Error during search: {e}")
+            logger.error(f"Error navigating to link: {e}")
             return False
+
     
     async def scroll_results(self, page: Page):
         """Scroll through results to load more items until no more results appear"""
@@ -447,22 +259,19 @@ class PlaceScraper:
             logger.info("Scrolling to load all results...")
             previous_count = 0
             no_change_count = 0
-            max_scrolls = 50  # Safety limit to prevent infinite scrolling
+            max_scrolls = 50
             scroll_count = 0
             
             while scroll_count < max_scrolls:
-                # Scroll down
                 await results_container.evaluate("el => el.scrollBy(0, el.scrollHeight)")
                 await asyncio.sleep(TIMING['scroll_delay'])
                 
-                # Count current results
                 current_results = await page.query_selector_all(SELECTORS['result_items'])
                 current_count = len(current_results)
                 
-                # Check if we've reached the end
                 if current_count == previous_count:
                     no_change_count += 1
-                    if no_change_count >= 3:  # No new results after 3 scrolls
+                    if no_change_count >= 3:
                         logger.info(f"Reached end of results after {scroll_count} scrolls")
                         break
                 else:
@@ -481,7 +290,6 @@ class PlaceScraper:
     async def extract_coordinates(self, page: Page) -> Tuple[Optional[float], Optional[float]]:
         """Extract latitude and longitude from URL or page content"""
         try:
-            # Method 1: From URL
             url = page.url
             if '@' in url:
                 coords_part = url.split('@')[1].split(',')
@@ -491,9 +299,7 @@ class PlaceScraper:
                     logger.debug(f"Coordinates from URL: {lat}, {lon}")
                     return lat, lon
             
-            # Method 2: From data attributes or meta tags
             lat_lon = await page.evaluate(r"""() => {
-                // Try to find coordinates in meta tags
                 const metaTag = document.querySelector('meta[itemprop="geo"]');
                 if (metaTag) {
                     const content = metaTag.getAttribute('content');
@@ -508,7 +314,6 @@ class PlaceScraper:
                     }
                 }
                 
-                // Try to find in page data
                 const scripts = document.querySelectorAll('script');
                 for (const script of scripts) {
                     const text = script.textContent;
@@ -552,30 +357,49 @@ class PlaceScraper:
         return None
     
     def extract_emails_from_text(self, text: str) -> Set[str]:
-        """Extract email addresses from text using regex with validation"""
+        """Extract email addresses from text using regex"""
         if not text:
             return set()
         
         emails = set(self.email_pattern.findall(text))
         
-        # Use validator to filter and clean
-        return EmailValidator.validate_and_clean(emails)
+        filtered_emails = set()
+        exclude_patterns = [
+            'example.com', 'test.com', 'domain.com', 
+            'email.com', 'yourdomain.com', 'yoursite.com',
+            'sentry.io', 'wixpress.com', 'schema.org',
+            '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+            'test@', 'demo@', 'sample@', 'noreply@', 'no-reply@',
+            'admin@example', 'user@example', 'info@example',
+            '@test.', '@demo.', '@sample.', '@placeholder.',
+            'placeholder@', 'fake@', 'dummy@'
+        ]
+        
+        for email in emails:
+            email_lower = email.lower()
+            # Skip if contains any exclude pattern
+            if any(pattern in email_lower for pattern in exclude_patterns):
+                continue
+            # Skip if it's just test/demo email
+            if email_lower.startswith(('test', 'demo', 'sample', 'fake', 'dummy')):
+                continue
+            filtered_emails.add(email)
+        
+        return filtered_emails
     
     async def scrape_emails_from_google_maps(self, page: Page) -> Set[str]:
         """Extract emails directly from Google Maps listing"""
         emails = set()
         
         try:
-            # Get all text content from the page
             page_text = await page.evaluate("() => document.body.innerText")
             emails.update(self.extract_emails_from_text(page_text))
             
-            # Check specific sections that might contain emails
             selectors_to_check = [
                 'div[role="main"]',
-                'div.m6QErb',  # Info section
-                'button[data-item-id]',  # Action buttons
-                'a[href^="mailto:"]'  # Mailto links
+                'div.m6QErb',
+                'button[data-item-id]',
+                'a[href^="mailto:"]'
             ]
             
             for selector in selectors_to_check:
@@ -585,7 +409,6 @@ class PlaceScraper:
                         text = await element.inner_text()
                         emails.update(self.extract_emails_from_text(text))
                         
-                        # Check href for mailto
                         href = await element.get_attribute('href')
                         if href and 'mailto:' in href:
                             email = href.replace('mailto:', '').split('?')[0]
@@ -603,7 +426,7 @@ class PlaceScraper:
         return emails
     
     async def scrape_emails_from_website(self, website_url: str, context: BrowserContext) -> Set[str]:
-        """Visit business website and scrape for emails - OPTIMIZED FOR SPEED"""
+        """Visit business website and scrape for emails - FAST + THOROUGH"""
         emails = set()
         
         if not website_url or 'google.com' in website_url:
@@ -611,23 +434,26 @@ class PlaceScraper:
         
         page = None
         try:
-            logger.debug(f"Checking website: {website_url}")
+            logger.debug(f"Checking: {website_url}")
             page = await context.new_page()
             
-            # SPEED: Shorter timeout, don't wait for images/css
-            await page.goto(website_url, timeout=8000, wait_until='domcontentloaded')
+            # SPEED: Block images, CSS, fonts - only load text
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "stylesheet", "font", "media"] else route.continue_())
             
-            # SPEED: Get content immediately without waiting
+            # Check homepage - fast timeout
+            await page.goto(website_url, timeout=5000, wait_until='domcontentloaded')
+            
+            # Get all text content
             page_text = await page.evaluate("() => document.body.innerText")
             page_html = await page.content()
             
             emails.update(self.extract_emails_from_text(page_text))
             emails.update(self.extract_emails_from_text(page_html))
             
-            # SPEED: Only check contact page if no emails found on homepage
+            # SMART: Only check contact if NO emails found on homepage
             if not emails:
                 try:
-                    # Look for contact link
+                    # Quick check for contact link
                     contact_link = await page.query_selector('a[href*="contact"]')
                     if contact_link:
                         href = await contact_link.get_attribute('href')
@@ -637,17 +463,20 @@ class PlaceScraper:
                                 href = urljoin(website_url, href)
                             
                             if href.startswith('http'):
-                                await page.goto(href, timeout=6000, wait_until='domcontentloaded')
-                                sub_text = await page.evaluate("() => document.body.innerText")
-                                emails.update(self.extract_emails_from_text(sub_text))
+                                # Fast contact page check
+                                await page.goto(href, timeout=4000, wait_until='domcontentloaded')
+                                contact_text = await page.evaluate("() => document.body.innerText")
+                                emails.update(self.extract_emails_from_text(contact_text))
                 except Exception:
-                    pass
+                    pass  # Skip if contact page fails
             
             if emails:
-                logger.info(f"Found {len(emails)} email(s): {', '.join(emails)}")
+                logger.info(f"✓ {len(emails)} email(s): {', '.join(emails)}")
+            else:
+                logger.debug("✗ No emails")
                 
         except Exception as e:
-            logger.debug(f"Error scraping website for emails: {e}")
+            logger.debug(f"Skip: {e}")
         finally:
             if page:
                 try:
@@ -656,69 +485,55 @@ class PlaceScraper:
                     pass
         
         return emails
+
     
     async def parse_place_details(self, page: Page, context: BrowserContext) -> Optional[Dict]:
         """Parse all details from a place page"""
         try:
-            await self.random_delay(TIMING['item_parse_delay'], TIMING['item_parse_delay'] + 0.5)
+            await self.random_delay(0.2, 0.5)  # Minimal delay
             
-            # Wait for page to fully load - minimal wait for speed
+            # Don't wait for networkidle - it's too slow. Just wait for domcontentloaded
             try:
                 await page.wait_for_load_state('domcontentloaded', timeout=5000)
             except:
                 pass  # Continue anyway
             
-            # Check for blocking
             if await self.check_for_captcha(page):
                 raise Exception("CAPTCHA detected during parsing")
             
-            # Get the place URL
             place_url = page.url
             
-            # Extract basic info
             name = await self.extract_text(page, SELECTORS['place_name'])
             if not name:
                 logger.debug("Could not extract place name, skipping")
                 return None
             
-            # Get coordinates
             lat, lon = await self.extract_coordinates(page)
             
-            # Check for duplicates
             if self.is_duplicate(name, lat, lon):
                 logger.debug(f"Duplicate found: {name}")
                 return None
             
-            # Extract address
             address = await self.extract_text(page, SELECTORS['place_address'])
-            
-            # Extract phone
             phone = await self.extract_text(page, SELECTORS['place_phone'])
             
-            # Extract emails from Google Maps page
             emails_from_maps = await self.scrape_emails_from_google_maps(page)
             
-            # Extract website - check multiple locations
             website = await self.extract_attribute(page, SELECTORS['place_website'], 'href')
             
-            # If no website found, check Menu tab
             if not website:
                 try:
                     website = await page.evaluate("""() => {
-                        // Look for Menu button/tab
                         let menuButtons = document.querySelectorAll('button[aria-label*="Menu"], button[data-item-id*="menu"]');
                         for (let btn of menuButtons) {
                             btn.click();
                         }
                         
-                        // Wait a bit for menu content to load
                         return new Promise(resolve => {
                             setTimeout(() => {
-                                // Look for website links in menu section
                                 let links = document.querySelectorAll('a[href*="http"]');
                                 for (let link of links) {
                                     let href = link.href;
-                                    // Filter out Google/Maps links
                                     if (href && !href.includes('google.com') && !href.includes('gstatic.com')) {
                                         resolve(href);
                                         return;
@@ -732,23 +547,18 @@ class PlaceScraper:
                 except Exception as e:
                     logger.debug(f"Error checking Menu tab for website: {e}")
             
-            # Scrape emails from website if available
             emails_from_website = set()
             if website and not self.skip_websites:
                 emails_from_website = await self.scrape_emails_from_website(website, context)
             
-            # Combine all emails
             all_emails = emails_from_maps.union(emails_from_website)
             email_string = ', '.join(sorted(all_emails)) if all_emails else None
             
-            # Extract category
             category = await self.extract_text(page, SELECTORS['place_category'])
             
-            # Extract rating - multiple methods
             rating = None
             try:
                 rating = await page.evaluate(r"""() => {
-                    // Method 1: Look for rating in common locations
                     let selectors = [
                         'div.F7nice span[aria-hidden="true"]',
                         'span.ceNzKf',
@@ -760,7 +570,6 @@ class PlaceScraper:
                         let elem = document.querySelector(selector);
                         if (elem) {
                             let text = elem.textContent || elem.getAttribute('aria-label') || '';
-                            // Extract number from text
                             let match = text.match(/(\d+\.?\d*)/);
                             if (match) {
                                 let num = parseFloat(match[1]);
@@ -771,7 +580,6 @@ class PlaceScraper:
                         }
                     }
                     
-                    // Method 2: Search all text for rating pattern
                     let allText = document.body.innerText;
                     let ratingMatch = allText.match(/(\d+\.\d+)\s*stars?/i);
                     if (ratingMatch) {
@@ -785,24 +593,20 @@ class PlaceScraper:
             except Exception as e:
                 logger.debug(f"Error extracting rating: {e}")
             
-            # Extract hours - multiple methods
             hours = None
             try:
                 hours = await page.evaluate("""() => {
-                    // Method 1: Look for hours button/div
                     let hoursButton = document.querySelector('button[data-item-id*="oh"], button[aria-label*="Hours"]');
                     if (hoursButton) {
                         let text = hoursButton.getAttribute('aria-label') || hoursButton.textContent;
                         if (text) return text.trim();
                     }
                     
-                    // Method 2: Look for hours in specific divs
                     let hoursDiv = document.querySelector('div[aria-label*="Hours"], div.t39EBf');
                     if (hoursDiv) {
                         return hoursDiv.textContent.trim();
                     }
                     
-                    // Method 3: Look for "Open" or "Closed" status
                     let statusSpans = document.querySelectorAll('span.ZDu9vd, span.o0Svhf');
                     for (let span of statusSpans) {
                         let text = span.textContent.trim();
@@ -818,13 +622,10 @@ class PlaceScraper:
             except Exception as e:
                 logger.debug(f"Error extracting hours: {e}")
             
-            # Extract price level - multiple methods
             price = None
             try:
-                # Method 1: From aria-label
                 price = await self.extract_attribute(page, SELECTORS['place_price'], 'aria-label')
                 
-                # Method 2: Count dollar signs
                 if not price:
                     price = await page.evaluate("""() => {
                         const priceSpans = document.querySelectorAll('span[aria-label*="Price"], span[aria-label*="price"]');
@@ -835,7 +636,6 @@ class PlaceScraper:
                             }
                         }
                         
-                        // Look for dollar signs
                         const dollarSigns = document.querySelector('span.mgr77e');
                         if (dollarSigns) {
                             return dollarSigns.textContent.trim();
@@ -847,19 +647,14 @@ class PlaceScraper:
             except Exception as e:
                 logger.debug(f"Error extracting price: {e}")
             
-            # Extract business status
             status = await self.extract_text(page, SELECTORS['place_status'])
-            
-            # Clean and validate data
-            cleaned_phone = DataCleaner.clean_phone(phone)
-            cleaned_address = DataCleaner.clean_address(address)
             
             place_data = {
                 'name': name,
-                'address': cleaned_address,
+                'address': address,
                 'latitude': lat,
                 'longitude': lon,
-                'phone': cleaned_phone,
+                'phone': phone,
                 'email': email_string,
                 'website': website,
                 'google_maps_url': place_url,
@@ -883,11 +678,9 @@ class PlaceScraper:
         if not name:
             return True
         
-        # Check by name first
         if name in self.seen_places:
             return True
         
-        # Check by coordinates (within tolerance)
         if lat and lon:
             for place in self.scraped_places:
                 if place['name'] == name:
@@ -913,7 +706,6 @@ class PlaceScraper:
             result_elements = await page.query_selector_all(SELECTORS['result_items'])
             links = []
             
-            # Collect all links (will be limited by max_results during processing)
             for element in result_elements:
                 try:
                     href = await element.get_attribute('href')
@@ -930,13 +722,8 @@ class PlaceScraper:
             return []
     
     async def scrape_with_retry(self, max_retries: int = 3) -> List[Dict]:
-        """Main scraping method with improved error handling and incremental saving"""
+        """Main scraping method with proxy rotation on failure"""
         retry_count = 0
-        
-        # Load previously scraped URLs for resume capability
-        already_scraped = self.saver.load_resume_state()
-        if already_scraped:
-            logger.info(f"[RESUME] Found {len(already_scraped)} previously scraped places, will skip them")
         
         while retry_count < max_retries:
             browser = None
@@ -944,117 +731,59 @@ class PlaceScraper:
             playwright = None
             
             try:
-                # Get proxy for this attempt
-                self.current_proxy = self.proxy_manager.get_next_proxy()
+                proxy = self.proxy_manager.get_next_proxy()
                 
-                # Setup browser
-                browser, context, playwright = await self.setup_browser(self.current_proxy)
+                browser, context, playwright = await self.setup_browser(proxy)
                 page = await context.new_page()
                 
-                # Perform search
-                if not await self.search_google_maps(page):
-                    self.proxy_manager.mark_proxy_error(self.current_proxy, "search_failed")
-                    raise Exception("Search failed or blocked")
+                if not await self.navigate_to_link(page):
+                    raise Exception("Navigation failed or blocked")
                 
-                # Collect result links
-                result_links = await self.collect_results(page)
+                link_type = self.detect_link_type(page.url)
                 
-                if not result_links:
-                    raise Exception("No results found")
-                
-                # Filter out already scraped links
-                result_links = [link for link in result_links if link not in already_scraped]
-                logger.info(f"[RESUME] {len(result_links)} new places to scrape")
-                
-                # Process places in batches for better performance
-                batch_size = 3  # Process 3 places at a time
-                
-                for batch_start in range(0, len(result_links), batch_size):
-                    batch_links = result_links[batch_start:batch_start + batch_size]
+                if link_type == 'place':
+                    # Single place - scrape it directly
+                    logger.info("Single place detected, scraping...")
+                    place_data = await self.parse_place_details(page, context)
+                    if place_data:
+                        self.scraped_places.append(place_data)
                     
-                    # Process each link in the batch
-                    for i, link in enumerate(batch_links):
-                        actual_index = batch_start + i
-                        
+                elif link_type == 'search':
+                    # Search results - collect and scrape all
+                    result_links = await self.collect_results(page)
+                    
+                    if not result_links:
+                        raise Exception("No results found")
+                    
+                    for i, link in enumerate(result_links):
                         if len(self.scraped_places) >= self.max_results:
                             logger.info(f"Reached max results limit: {self.max_results}")
                             break
                         
-                        # Retry logic for individual place
-                        place_retry = 0
-                        max_place_retry = 2
-                        place_data = None
-                        
-                        while place_retry < max_place_retry and not place_data:
+                        try:
+                            logger.info(f"Processing result {i+1}/{len(result_links)}")
+                            await page.goto(link, timeout=15000, wait_until='domcontentloaded')
+                            await self.random_delay(0.5, 1)  # Faster delay
+                            
+                            if await self.check_for_captcha(page):
+                                raise Exception("CAPTCHA detected, rotating proxy")
+                            
+                            place_data = await self.parse_place_details(page, context)
+                            if place_data:
+                                self.scraped_places.append(place_data)
+                            
                             try:
-                                # Rotate proxy every 4 places or on specific errors
-                                if self.current_proxy and actual_index > 0 and actual_index % 4 == 0:
-                                    logger.info("[ROTATION] Rotating proxy for better anonymity...")
-                                    await context.close()
-                                    await browser.close()
-                                    
-                                    self.current_proxy = self.proxy_manager.get_next_proxy()
-                                    browser, context, playwright = await self.setup_browser(self.current_proxy)
-                                    page = await context.new_page()
-                                    
-                                    await self.search_google_maps(page)
-                                    await self.random_delay(1, 2)
-                                
-                                await page.goto(link, timeout=TIMING['navigation_timeout'], wait_until='domcontentloaded')
-                                await self.random_delay(2, 3)
-                                
-                                # Check for blocking
-                                if await self.check_for_captcha(page):
-                                    self.proxy_manager.mark_proxy_error(self.current_proxy, "captcha")
-                                    raise Exception("CAPTCHA detected, rotating proxy")
-                                
-                                # Parse place details
-                                place_data = await self.parse_place_details(page, context)
-                                
-                                if place_data:
-                                    # Save immediately
-                                    self.saver.save_place(place_data)
-                                    self.scraped_places.append(place_data)
-                                    self.progress.increment_success()
-                                    
-                                    # Reset proxy error count on success
-                                    self.proxy_manager.reset_proxy_errors(self.current_proxy)
-                                else:
-                                    raise Exception("Failed to parse place data")
-                                
-                                # Go back to results
-                                await page.go_back(timeout=TIMING['navigation_timeout'])
-                                await self.random_delay(0.5, 1)
-                                
-                            except Exception as e:
-                                place_retry += 1
-                                error_msg = str(e)
-                                
-                                # Check for proxy-related errors
-                                if any(err in error_msg.lower() for err in ['timeout', 'captcha', 'blocked', '403', '429']):
-                                    self.proxy_manager.mark_proxy_error(self.current_proxy, error_msg)
-                                    
-                                    if place_retry < max_place_retry:
-                                        logger.warning(f"[RETRY] Retrying place {actual_index+1} (attempt {place_retry}/{max_place_retry})")
-                                        # Rotate proxy for retry
-                                        await context.close()
-                                        await browser.close()
-                                        self.current_proxy = self.proxy_manager.get_next_proxy()
-                                        browser, context, playwright = await self.setup_browser(self.current_proxy)
-                                        page = await context.new_page()
-                                        await self.search_google_maps(page)
-                                        await self.random_delay(1, 2)
-                                
-                                if place_retry >= max_place_retry:
-                                    logger.warning(f"[FAILED] Failed to scrape place after {max_place_retry} retries: {error_msg}")
-                                    self.saver.save_failed_url(link, error_msg)
-                                    self.progress.increment_failed()
-                                    break
-                                
-                                if "CAPTCHA" in error_msg or "blocked" in error_msg.lower():
-                                    raise  # Re-raise to trigger full retry
+                                await page.go_back(timeout=10000)
+                            except:
+                                pass  # Ignore go_back errors
+                            await self.random_delay(0.2, 0.4)  # Minimal delay
+                            
+                        except Exception as e:
+                            logger.warning(f"Error processing result {i+1}: {e}")
+                            if "CAPTCHA" in str(e):
+                                raise
+                            continue
                 
-                # Success - return results
                 logger.info(f"Successfully scraped {len(self.scraped_places)} places")
                 return self.scraped_places
                 
@@ -1069,7 +798,6 @@ class PlaceScraper:
                     logger.error("Max retries reached, giving up")
                 
             finally:
-                # Proper cleanup to avoid Windows pipe errors
                 try:
                     if context:
                         await context.close()
@@ -1083,106 +811,119 @@ class PlaceScraper:
         return self.scraped_places
 
 
+def save_results(places: List[Dict], link_type: str):
+    """Save results to CSV and JSON files"""
+    if not places:
+        logger.warning("No results to save")
+        return
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_filename = f"results_link_{link_type}_{timestamp}"
+    
+    csv_filename = f"{base_filename}.csv"
+    try:
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+            if places:
+                writer = csv.DictWriter(f, fieldnames=places[0].keys())
+                writer.writeheader()
+                writer.writerows(places)
+        logger.info(f"Saved {len(places)} results to {csv_filename}")
+    except Exception as e:
+        logger.error(f"Error saving CSV: {e}")
+    
+    jsonl_filename = f"{base_filename}.jsonl"
+    try:
+        with open(jsonl_filename, 'w', encoding='utf-8') as f:
+            for place in places:
+                f.write(json.dumps(place) + '\n')
+        logger.info(f"Saved {len(places)} results to {jsonl_filename}")
+    except Exception as e:
+        logger.error(f"Error saving JSONL: {e}")
+
+
 async def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description='Google Maps Scraper with Playwright',
+        description='Google Maps Scraper by Link using Playwright',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Interactive mode (just run the script)
-  python scraper.py
+  # Interactive mode
+  python scraper_by_link.py
   
-  # Command-line mode
-  python scraper.py --keyword "cafe" --location "New York" --max 10
+  # Command-line mode with search link
+  python scraper_by_link.py --url "https://www.google.com/maps/search/cafe+in+Miami/"
   
-  # With proxies
-  python scraper.py --keyword "gym" --location "90210" --max 20 --proxy-file proxies.txt
+  # With single place link
+  python scraper_by_link.py --url "https://www.google.com/maps/place/Starbucks/@40.7,-74.0,17z"
+  
+  # With short link
+  python scraper_by_link.py --url "https://maps.app.goo.gl/abc123"
         """
     )
     
-    parser.add_argument('--keyword', help='Search keyword (e.g., "cafe", "gym")')
-    parser.add_argument('--location', help='Location (city name or zip code)')
-    parser.add_argument('--max', type=int, default=50, help='Maximum number of places to scrape (default: 50)')
-    parser.add_argument('--headless', type=str, default='false', choices=['true', 'false'], 
-                       help='Run in headless mode (default: false - shows browser)')
-    parser.add_argument('--proxy-file', type=str, default='proxies.txt', help='Path to proxy file (default: proxies.txt, format: ip:port:username:password)')
+    parser.add_argument('--url', help='Google Maps URL (search, place, or short link)')
+    parser.add_argument('--max', type=int, default=70, help='Maximum number of places to scrape (default: 70)')
+    parser.add_argument('--headless', type=str, default='true', choices=['true', 'false'], 
+                       help='Run in headless mode (default: true)')
+    parser.add_argument('--proxy-file', type=str, default='proxies.txt', help='Path to proxy file')
     parser.add_argument('--scrape-websites', action='store_true', help='Visit websites for emails (slower but finds more emails)')
     
     args = parser.parse_args()
     
-    # Interactive mode: prompt for keyword and location if not provided
-    if not args.keyword:
+    # Interactive mode - always ask for URL
+    if not args.url:
         print("\n" + "="*60)
-        print("Google Maps Scraper - Interactive Mode")
+        print("Google Maps Scraper by Link")
         print("="*60)
-        keyword = input("\nEnter search keyword (e.g., cafe, restaurant, gym): ").strip()
-        if not keyword:
-            print("[ERROR] Keyword cannot be empty!")
+        print("\nPaste any Google Maps link:")
+        print("  - Search results: https://www.google.com/maps/search/cafe+in+Miami/")
+        print("  - Single place: https://www.google.com/maps/place/Starbucks/...")
+        print("  - Short link: https://maps.app.goo.gl/abc123")
+        print()
+        maps_url = input("Google Maps URL: ").strip()
+        if not maps_url:
+            print("[ERROR] URL cannot be empty!")
             return
     else:
-        keyword = args.keyword
+        maps_url = args.url
     
-    if not args.location:
-        location = input("Enter location (city name or zip code): ").strip()
-        if not location:
-            print("[ERROR] Location cannot be empty!")
-            return
-    else:
-        location = args.location
+    # Validate URL
+    if 'google.com/maps' not in maps_url and 'goo.gl' not in maps_url:
+        print("[ERROR] Invalid Google Maps URL!")
+        return
     
-    # Use defaults: 150 max, headless true
-    max_results = args.max
-    headless = args.headless.lower() == 'true'
+    # Visible browser by default, use args.max, scrape websites for emails
+    headless = False  # Show browser so you can watch
+    max_results = args.max  # Use the --max argument
+    skip_websites = False  # Always scrape websites for emails
     
     logger.info("="*60)
-    logger.info("Google Maps Scraper Started")
-    logger.info(f"Keyword: {keyword}")
-    logger.info(f"Location: {location}")
+    logger.info("Google Maps Scraper by Link Started")
+    logger.info(f"URL: {maps_url}")
     logger.info(f"Max Results: {max_results}")
     logger.info(f"Headless: {headless}")
+    logger.info(f"Skip Websites: {skip_websites}")
     logger.info(f"Proxy File: {args.proxy_file or 'None'}")
     logger.info("="*60)
     
-    # Initialize components
     proxy_manager = ProxyManager(args.proxy_file)
-    saver = IncrementalSaver(keyword, location)
-    progress = ProgressTracker(args.max)
     
-    if proxy_manager.proxies:
-        logger.info(f"[SUCCESS] Loaded {len(proxy_manager.proxies)} proxies - Rotation enabled!")
-    else:
-        logger.warning("[WARNING] No proxies loaded - Running without proxy rotation")
-    
-    # Initialize scraper with all components
-    scraper = PlaceScraper(
-        keyword=keyword,
-        location=location,
-        max_results=args.max,
+    scraper = LinkScraper(
+        maps_url=maps_url,
+        max_results=max_results,
         headless=headless,
         proxy_manager=proxy_manager,
-        saver=saver,
-        progress=progress,
-        skip_websites=False  # Always scrape websites for emails
+        skip_websites=skip_websites
     )
     
-    # Display progress header
-    print("\n" + "="*60)
-    print("SCRAPING PROGRESS")
-    print("="*60)
-    
-    # Run scraper (results are saved incrementally)
     results = await scraper.scrape_with_retry(max_retries=3)
     
-    # Final summary
-    print("\n" + "="*60)
-    logger.info(f"Scraping completed!")
-    logger.info(f"Total successful: {progress.success}")
-    logger.info(f"Total failed: {progress.failed}")
-    logger.info(f"Results saved to: {saver.csv_filename}")
-    logger.info(f"Results saved to: {saver.jsonl_filename}")
-    if progress.failed > 0:
-        logger.info(f"Failed URLs saved to: {saver.failed_filename}")
+    link_type = scraper.detect_link_type(maps_url)
+    save_results(results, link_type)
+    
+    logger.info("="*60)
+    logger.info(f"Scraping completed! Total results: {len(results)}")
     logger.info("="*60)
 
 

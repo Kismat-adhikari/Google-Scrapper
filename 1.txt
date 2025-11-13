@@ -1,0 +1,1 @@
+python scraper.py --keyword "restaurant" --location "Los Angeles" --max 200 --headless true --proxy-file proxies.txt

@@ -30,33 +30,33 @@ playwright install chromium
 
 ### Basic Examples
 
-**Headful mode (default - for debugging):**
+**Scrape up to 150 results (default):**
 ```bash
-python scraper.py --keyword "cafe" --location "New York" --max 10
+python scraper.py --keyword "cafe" --location "New York" --headless true
 ```
 
-**Headless mode:**
+**Limit to specific number:**
 ```bash
 python scraper.py --keyword "gym" --location "90210" --max 20 --headless true
 ```
 
-**With proxy rotation:**
+**Scrape maximum results (200):**
 ```bash
-python scraper.py --keyword "restaurant" --location "Los Angeles" --max 50 --proxy-file proxies.txt
+python scraper.py --keyword "restaurant" --location "Los Angeles" --max 200 --headless true --proxy-file proxies.txt
 ```
 
-**Full featured:**
+**Headful mode for debugging:**
 ```bash
-python scraper.py --keyword "hotel" --location "Miami" --max 100 --headless false --proxy-file proxies.txt
+python scraper.py --keyword "hotel" --location "Miami" --max 10 --headless false
 ```
 
 ### Command-Line Arguments
 
 - `--keyword` (required): Search term (e.g., "cafe", "gym", "restaurant")
 - `--location` (required): City name or zip code (e.g., "New York", "90210")
-- `--max` (optional): Maximum number of places to scrape (default: 10)
+- `--max` (optional): Maximum number of places to scrape (default: 150, Google Maps typically shows 120-200 max)
 - `--headless` (optional): Run in headless mode - "true" or "false" (default: false)
-- `--proxy-file` (optional): Path to proxy file
+- `--proxy-file` (optional): Path to proxy file (recommended for scrapes over 50 results)
 
 ### Proxy File Format
 

@@ -21,9 +21,9 @@ SELECTORS = {
 
 # Timing settings (in milliseconds)
 TIMING = {
-    "page_load_timeout": 30000,
-    "navigation_timeout": 30000,
-    "networkidle_timeout": 15000,  # Increased for proxy usage
+    "page_load_timeout": 45000,
+    "navigation_timeout": 45000,
+    "networkidle_timeout": 30000,  # Increased for proxy usage - wait longer for pages to load
     "min_delay": 1.5,
     "max_delay": 3.5,
     "scroll_delay": 0.8,
