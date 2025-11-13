@@ -1,1 +1,7 @@
-python scraper.py --keyword "restaurant" --location "Los Angeles" --max 200 --headless true --proxy-file proxies.txt
+TO SEARCH WITH KEYOWRDS AND ZIP/PLACE NAME:
+python scraper.py
+
+
+
+TO SEARCH WITH URL:
+python scraper_by_link.py
