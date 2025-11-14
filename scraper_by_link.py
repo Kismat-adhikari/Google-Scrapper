@@ -141,11 +141,13 @@ class IncrementalSaver:
 
 
 class ProxyManager:
-    """Manages proxy rotation from file"""
+    """Manages proxy rotation from file with dead proxy tracking"""
     
     def __init__(self, proxy_file: Optional[str] = None):
         self.proxies = []
         self.current_index = 0
+        self.dead_proxies = set()  # Track failed proxies
+        self.proxy_errors = {}  # Count errors per proxy
         
         if proxy_file and Path(proxy_file).exists():
             self.load_proxies(proxy_file)
@@ -173,13 +175,60 @@ class ProxyManager:
             logger.error(f"Error loading proxies: {e}")
     
     def get_next_proxy(self) -> Optional[Dict]:
-        """Get next proxy in rotation"""
+        """Get next proxy in rotation, skipping dead ones"""
         if not self.proxies:
             return None
         
-        proxy = self.proxies[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.proxies)
-        return proxy
+        # Skip dead proxies
+        attempts = 0
+        max_attempts = len(self.proxies)
+        
+        while attempts < max_attempts:
+            proxy = self.proxies[self.current_index]
+            proxy_id = proxy.get('server', 'unknown')
+            
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            
+            # Skip if marked as dead
+            if proxy_id in self.dead_proxies:
+                attempts += 1
+                continue
+            
+            # Log which proxy is being used (mask sensitive info)
+            proxy_ip = proxy_id.replace('http://', '').split(':')[0] if proxy_id else 'unknown'
+            logger.info(f"[PROXY] Using proxy: {proxy_ip}... ({self.current_index}/{len(self.proxies)})")
+            
+            return proxy
+        
+        # All proxies are dead
+        logger.error("All proxies are marked as dead!")
+        return None
+    
+    def mark_proxy_error(self, proxy: Optional[Dict], error_type: str = "unknown"):
+        """Mark a proxy as having an error"""
+        if not proxy:
+            return
+        
+        proxy_id = proxy.get('server', 'unknown')
+        
+        if proxy_id not in self.proxy_errors:
+            self.proxy_errors[proxy_id] = 0
+        
+        self.proxy_errors[proxy_id] += 1
+        
+        # Mark as dead after 3 consecutive errors
+        if self.proxy_errors[proxy_id] >= 3:
+            self.dead_proxies.add(proxy_id)
+            logger.warning(f"[PROXY] Marked proxy as dead after {self.proxy_errors[proxy_id]} errors: {proxy_id.replace('http://', '').split(':')[0]}")
+    
+    def reset_proxy_errors(self, proxy: Optional[Dict]):
+        """Reset error count for a working proxy"""
+        if not proxy:
+            return
+        
+        proxy_id = proxy.get('server', 'unknown')
+        if proxy_id in self.proxy_errors:
+            self.proxy_errors[proxy_id] = 0
 
 
 class LinkScraper:
@@ -196,6 +245,7 @@ class LinkScraper:
         self.skip_websites = skip_websites
         self.scraped_places = []
         self.seen_places = set()
+        self.current_proxy = None  # Track current proxy for error marking
         
         # Email regex pattern
         self.email_pattern = re.compile(
@@ -839,12 +889,14 @@ class LinkScraper:
             playwright = None
             
             try:
-                proxy = self.proxy_manager.get_next_proxy()
+                # Get proxy for this attempt
+                self.current_proxy = self.proxy_manager.get_next_proxy()
                 
-                browser, context, playwright = await self.setup_browser(proxy)
+                browser, context, playwright = await self.setup_browser(self.current_proxy)
                 page = await context.new_page()
                 
                 if not await self.navigate_to_link(page):
+                    self.proxy_manager.mark_proxy_error(self.current_proxy, "navigation_failed")
                     raise Exception("Navigation failed or blocked")
                 
                 link_type = self.detect_link_type(page.url)
@@ -881,6 +933,19 @@ class LinkScraper:
                             logger.info(f"Reached max results limit: {self.max_results}")
                             break
                         
+                        # Rotate proxy every 4 places for better anonymity
+                        if self.current_proxy and i > 0 and i % 4 == 0:
+                            logger.info("[ROTATION] Rotating proxy for better anonymity...")
+                            await context.close()
+                            await browser.close()
+                            
+                            self.current_proxy = self.proxy_manager.get_next_proxy()
+                            browser, context, playwright = await self.setup_browser(self.current_proxy)
+                            page = await context.new_page()
+                            
+                            await self.navigate_to_link(page)
+                            await self.random_delay(1, 2)
+                        
                         # Retry logic for individual place
                         place_retry = 0
                         max_place_retry = 2
@@ -892,6 +957,7 @@ class LinkScraper:
                                 await self.random_delay(2, 3)
                                 
                                 if await self.check_for_captcha(page):
+                                    self.proxy_manager.mark_proxy_error(self.current_proxy, "captcha")
                                     raise Exception("CAPTCHA detected, rotating proxy")
                                 
                                 place_data = await self.parse_place_details(page, context)
@@ -901,6 +967,9 @@ class LinkScraper:
                                     self.saver.save_place(place_data)
                                     self.scraped_places.append(place_data)
                                     self.progress.increment_success()
+                                    
+                                    # Reset proxy error count on success
+                                    self.proxy_manager.reset_proxy_errors(self.current_proxy)
                                 else:
                                     raise Exception("Failed to parse place data")
                                 
@@ -911,6 +980,21 @@ class LinkScraper:
                             except Exception as e:
                                 place_retry += 1
                                 error_msg = str(e)
+                                
+                                # Check for proxy-related errors
+                                if any(err in error_msg.lower() for err in ['timeout', 'captcha', 'blocked', '403', '429']):
+                                    self.proxy_manager.mark_proxy_error(self.current_proxy, error_msg)
+                                    
+                                    if place_retry < max_place_retry:
+                                        logger.warning(f"[RETRY] Retrying place {i+1} (attempt {place_retry}/{max_place_retry})")
+                                        # Rotate proxy for retry
+                                        await context.close()
+                                        await browser.close()
+                                        self.current_proxy = self.proxy_manager.get_next_proxy()
+                                        browser, context, playwright = await self.setup_browser(self.current_proxy)
+                                        page = await context.new_page()
+                                        await self.navigate_to_link(page)
+                                        await self.random_delay(1, 2)
                                 
                                 if place_retry >= max_place_retry:
                                     logger.warning(f"[FAILED] Failed to scrape place after {max_place_retry} retries: {error_msg}")
