@@ -1,0 +1,3 @@
+https://www.google.com/maps/place/Rosetta+Bakery/data=!4m7!3m6!1s0x88d9b492786b3bad:0xfa9ca54e64515e24!8m2!3d25.7799115!4d-80.1317117!16s%2Fg%2F11f4r4nhh2!19sChIJrTtreJK02YgRJF5RZE6lnPo?authuser=0&hl=en&rclk=1 | Error: Failed to parse place data
+https://www.google.com/maps/place/Pura+Vida+Miami/data=!4m7!3m6!1s0x88d9b54ac2f5a693:0x54b2d6324b04b45d!8m2!3d25.7954185!4d-80.1415462!16s%2Fg%2F11ryt37wzm!19sChIJk6b1wkq12YgRXbQESzLWslQ?authuser=0&hl=en&rclk=1 | Error: Failed to parse place data
+https://www.google.com/maps/place/Pura+Vida+Miami/data=!4m7!3m6!1s0x88d9b58a91599add:0xce0c6150e4977096!8m2!3d25.7798299!4d-80.1417259!16s%2Fg%2F11mn14hr4p!19sChIJ3ZpZkYq12YgRlnCX5FBhDM4?authuser=0&hl=en&rclk=1 | Error: Failed to parse place data

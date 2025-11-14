@@ -40,6 +40,106 @@ def setup_logging(log_file: str = "scraper_link.log"):
 logger = setup_logging()
 
 
+class ProgressTracker:
+    """Track and display scraping progress"""
+    def __init__(self, total: int):
+        self.total = total
+        self.success = 0
+        self.failed = 0
+        self.current = 0
+    
+    def increment_success(self):
+        self.success += 1
+        self.current += 1
+        self.display()
+    
+    def increment_failed(self):
+        self.failed += 1
+        self.current += 1
+        self.display()
+    
+    def display(self):
+        percent = (self.current / self.total * 100) if self.total > 0 else 0
+        bar_length = 30
+        filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
+        bar = '=' * filled + '>' + '.' * (bar_length - filled - 1) if filled < bar_length else '=' * bar_length
+        
+        print(f"\r[{bar}] {self.current}/{self.total} | Success: {self.success} | Failed: {self.failed} | {percent:.1f}%", end='', flush=True)
+        
+        if self.current >= self.total:
+            print()  # New line when complete
+
+
+class IncrementalSaver:
+    """Save results incrementally as they're scraped"""
+    def __init__(self, link_type: str):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.base_filename = f"results_link_{link_type}_{timestamp}"
+        self.csv_filename = f"{self.base_filename}.csv"
+        self.jsonl_filename = f"{self.base_filename}.jsonl"
+        self.resume_filename = f"{self.base_filename}_resume.json"
+        self.failed_filename = f"{self.base_filename}_failed.txt"
+        self.csv_initialized = False
+        self.scraped_urls = set()
+        
+    def save_place(self, place: Dict):
+        """Save a single place immediately"""
+        # Save to CSV
+        try:
+            import os
+            file_exists = os.path.exists(self.csv_filename)
+            with open(self.csv_filename, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=place.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(place)
+        except Exception as e:
+            logger.error(f"Error saving to CSV: {e}")
+        
+        # Save to JSONL
+        try:
+            with open(self.jsonl_filename, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(place) + '\n')
+        except Exception as e:
+            logger.error(f"Error saving to JSONL: {e}")
+        
+        # Track scraped URL
+        if 'google_maps_url' in place:
+            self.scraped_urls.add(place['google_maps_url'])
+            self.save_resume_state()
+    
+    def save_failed_url(self, url: str, error: str):
+        """Save failed URLs for manual review"""
+        try:
+            with open(self.failed_filename, 'a', encoding='utf-8') as f:
+                f.write(f"{url} | Error: {error}\n")
+        except Exception as e:
+            logger.error(f"Error saving failed URL: {e}")
+    
+    def save_resume_state(self):
+        """Save current progress for resume capability"""
+        try:
+            with open(self.resume_filename, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'scraped_urls': list(self.scraped_urls),
+                    'timestamp': datetime.now().isoformat()
+                }, f)
+        except Exception as e:
+            logger.error(f"Error saving resume state: {e}")
+    
+    def load_resume_state(self) -> Set[str]:
+        """Load previously scraped URLs"""
+        import os
+        if os.path.exists(self.resume_filename):
+            try:
+                with open(self.resume_filename, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return set(data.get('scraped_urls', []))
+            except Exception as e:
+                logger.error(f"Error loading resume state: {e}")
+        return set()
+
+
 class ProxyManager:
     """Manages proxy rotation from file"""
     
@@ -85,11 +185,14 @@ class ProxyManager:
 class LinkScraper:
     """Main scraper class for Google Maps links"""
     
-    def __init__(self, maps_url: str, max_results: int, headless: bool, proxy_manager: ProxyManager, skip_websites: bool = False):
+    def __init__(self, maps_url: str, max_results: int, headless: bool, proxy_manager: ProxyManager, 
+                 saver: IncrementalSaver, progress: ProgressTracker, skip_websites: bool = False):
         self.maps_url = maps_url
         self.max_results = max_results
         self.headless = headless
         self.proxy_manager = proxy_manager
+        self.saver = saver
+        self.progress = progress
         self.skip_websites = skip_websites
         self.scraped_places = []
         self.seen_places = set()
@@ -150,8 +253,8 @@ class LinkScraper:
     
     async def random_delay(self, min_sec: float = None, max_sec: float = None):
         """Add random human-like delay"""
-        min_sec = min_sec or 0.3  # Faster delays
-        max_sec = max_sec or 0.8  # Faster delays
+        min_sec = min_sec or TIMING['min_delay']
+        max_sec = max_sec or TIMING['max_delay']
         await asyncio.sleep(random.uniform(min_sec, max_sec))
     
     async def check_for_captcha(self, page: Page) -> bool:
@@ -490,7 +593,7 @@ class LinkScraper:
     async def parse_place_details(self, page: Page, context: BrowserContext) -> Optional[Dict]:
         """Parse all details from a place page"""
         try:
-            await self.random_delay(0.2, 0.5)  # Minimal delay
+            await self.random_delay(TIMING['item_parse_delay'], TIMING['item_parse_delay'] + 0.5)
             
             # Don't wait for networkidle - it's too slow. Just wait for domcontentloaded
             try:
@@ -722,8 +825,13 @@ class LinkScraper:
             return []
     
     async def scrape_with_retry(self, max_retries: int = 3) -> List[Dict]:
-        """Main scraping method with proxy rotation on failure"""
+        """Main scraping method with proxy rotation on failure and incremental saving"""
         retry_count = 0
+        
+        # Load previously scraped URLs for resume capability
+        already_scraped = self.saver.load_resume_state()
+        if already_scraped:
+            logger.info(f"[RESUME] Found {len(already_scraped)} previously scraped places, will skip them")
         
         while retry_count < max_retries:
             browser = None
@@ -744,9 +852,18 @@ class LinkScraper:
                 if link_type == 'place':
                     # Single place - scrape it directly
                     logger.info("Single place detected, scraping...")
+                    
+                    # Check if already scraped
+                    if page.url in already_scraped:
+                        logger.info("[RESUME] Place already scraped, skipping")
+                        return self.scraped_places
+                    
                     place_data = await self.parse_place_details(page, context)
                     if place_data:
+                        # Save immediately
+                        self.saver.save_place(place_data)
                         self.scraped_places.append(place_data)
+                        self.progress.increment_success()
                     
                 elif link_type == 'search':
                     # Search results - collect and scrape all
@@ -755,34 +872,54 @@ class LinkScraper:
                     if not result_links:
                         raise Exception("No results found")
                     
+                    # Filter out already scraped links
+                    result_links = [link for link in result_links if link not in already_scraped]
+                    logger.info(f"[RESUME] {len(result_links)} new places to scrape")
+                    
                     for i, link in enumerate(result_links):
                         if len(self.scraped_places) >= self.max_results:
                             logger.info(f"Reached max results limit: {self.max_results}")
                             break
                         
-                        try:
-                            logger.info(f"Processing result {i+1}/{len(result_links)}")
-                            await page.goto(link, timeout=15000, wait_until='domcontentloaded')
-                            await self.random_delay(0.5, 1)  # Faster delay
-                            
-                            if await self.check_for_captcha(page):
-                                raise Exception("CAPTCHA detected, rotating proxy")
-                            
-                            place_data = await self.parse_place_details(page, context)
-                            if place_data:
-                                self.scraped_places.append(place_data)
-                            
+                        # Retry logic for individual place
+                        place_retry = 0
+                        max_place_retry = 2
+                        place_data = None
+                        
+                        while place_retry < max_place_retry and not place_data:
                             try:
-                                await page.go_back(timeout=10000)
-                            except:
-                                pass  # Ignore go_back errors
-                            await self.random_delay(0.2, 0.4)  # Minimal delay
-                            
-                        except Exception as e:
-                            logger.warning(f"Error processing result {i+1}: {e}")
-                            if "CAPTCHA" in str(e):
-                                raise
-                            continue
+                                await page.goto(link, timeout=TIMING['navigation_timeout'], wait_until='domcontentloaded')
+                                await self.random_delay(2, 3)
+                                
+                                if await self.check_for_captcha(page):
+                                    raise Exception("CAPTCHA detected, rotating proxy")
+                                
+                                place_data = await self.parse_place_details(page, context)
+                                
+                                if place_data:
+                                    # Save immediately
+                                    self.saver.save_place(place_data)
+                                    self.scraped_places.append(place_data)
+                                    self.progress.increment_success()
+                                else:
+                                    raise Exception("Failed to parse place data")
+                                
+                                # Go back to results
+                                await page.go_back(timeout=TIMING['navigation_timeout'])
+                                await self.random_delay(0.5, 1)
+                                
+                            except Exception as e:
+                                place_retry += 1
+                                error_msg = str(e)
+                                
+                                if place_retry >= max_place_retry:
+                                    logger.warning(f"[FAILED] Failed to scrape place after {max_place_retry} retries: {error_msg}")
+                                    self.saver.save_failed_url(link, error_msg)
+                                    self.progress.increment_failed()
+                                    break
+                                
+                                if "CAPTCHA" in error_msg or "blocked" in error_msg.lower():
+                                    raise  # Re-raise to trigger full retry
                 
                 logger.info(f"Successfully scraped {len(self.scraped_places)} places")
                 return self.scraped_places
@@ -811,34 +948,7 @@ class LinkScraper:
         return self.scraped_places
 
 
-def save_results(places: List[Dict], link_type: str):
-    """Save results to CSV and JSON files"""
-    if not places:
-        logger.warning("No results to save")
-        return
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_filename = f"results_link_{link_type}_{timestamp}"
-    
-    csv_filename = f"{base_filename}.csv"
-    try:
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
-            if places:
-                writer = csv.DictWriter(f, fieldnames=places[0].keys())
-                writer.writeheader()
-                writer.writerows(places)
-        logger.info(f"Saved {len(places)} results to {csv_filename}")
-    except Exception as e:
-        logger.error(f"Error saving CSV: {e}")
-    
-    jsonl_filename = f"{base_filename}.jsonl"
-    try:
-        with open(jsonl_filename, 'w', encoding='utf-8') as f:
-            for place in places:
-                f.write(json.dumps(place) + '\n')
-        logger.info(f"Saved {len(places)} results to {jsonl_filename}")
-    except Exception as e:
-        logger.error(f"Error saving JSONL: {e}")
+# Note: save_results() is no longer needed - IncrementalSaver handles all saving
 
 
 async def main():
@@ -907,23 +1017,48 @@ Examples:
     logger.info(f"Proxy File: {args.proxy_file or 'None'}")
     logger.info("="*60)
     
+    # Initialize components
     proxy_manager = ProxyManager(args.proxy_file)
+    
+    # Detect link type early for saver
+    temp_scraper = LinkScraper.__new__(LinkScraper)
+    link_type = temp_scraper.detect_link_type(maps_url)
+    
+    saver = IncrementalSaver(link_type)
+    progress = ProgressTracker(max_results)
+    
+    if proxy_manager.proxies:
+        logger.info(f"[SUCCESS] Loaded {len(proxy_manager.proxies)} proxies - Rotation enabled!")
+    else:
+        logger.warning("[WARNING] No proxies loaded - Running without proxy rotation")
     
     scraper = LinkScraper(
         maps_url=maps_url,
         max_results=max_results,
         headless=headless,
         proxy_manager=proxy_manager,
+        saver=saver,
+        progress=progress,
         skip_websites=skip_websites
     )
     
+    # Display progress header
+    print("\n" + "="*60)
+    print("SCRAPING PROGRESS")
+    print("="*60)
+    
+    # Run scraper (results are saved incrementally)
     results = await scraper.scrape_with_retry(max_retries=3)
     
-    link_type = scraper.detect_link_type(maps_url)
-    save_results(results, link_type)
-    
-    logger.info("="*60)
-    logger.info(f"Scraping completed! Total results: {len(results)}")
+    # Final summary
+    print("\n" + "="*60)
+    logger.info(f"Scraping completed!")
+    logger.info(f"Total successful: {progress.success}")
+    logger.info(f"Total failed: {progress.failed}")
+    logger.info(f"Results saved to: {saver.csv_filename}")
+    logger.info(f"Results saved to: {saver.jsonl_filename}")
+    if progress.failed > 0:
+        logger.info(f"Failed URLs saved to: {saver.failed_filename}")
     logger.info("="*60)
 
 
